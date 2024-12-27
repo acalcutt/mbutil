@@ -99,7 +99,7 @@ def mbtiles_connect(mbtiles_file, silent):
 
 
 def optimize_connection(cur):
-    cur.execute("""PRAGMA synchronous=0""")
+    #cur.execute("""PRAGMA synchronous=0""")
     cur.execute("""PRAGMA journal_mode=WAL""")
 
 
