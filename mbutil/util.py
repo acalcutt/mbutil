@@ -9,21 +9,52 @@
 # for additional reference on schema see:
 # https://github.com/mapbox/node-mbtiles/blob/master/lib/schema.sql
 
-import sqlite3, sys, logging, time, os, json, zlib, re
+import sqlite3, sys, logging, time, os, json, zlib, re, hashlib
 
 logger = logging.getLogger(__name__)
 
 def flip_y(zoom, y):
     return (2**zoom-1) - y
 
+def fnv1a(data):
+    """
+    A simple FNV-1a hash to generate tile ids
+    """
+    hash = 0x811c9dc5
+    for b in bytearray(data):
+        hash = (hash ^ b) * 0x1000193
+    return hash & 0xFFFFFFFF
+
 def mbtiles_setup(cur):
     cur.execute("""
-        create table tiles (
-            zoom_level integer,
-            tile_column integer,
-            tile_row integer,
-            tile_data blob);
-            """)
+        CREATE TABLE tiles_shallow (
+            TILES_COL_Z integer,
+            TILES_COL_X integer,
+            TILES_COL_Y integer,
+            TILES_COL_DATA_ID text,
+            primary key(TILES_COL_Z,TILES_COL_X,TILES_COL_Y)
+        ) without rowid;
+    """)
+    cur.execute("""
+        CREATE TABLE tiles_data (
+            tile_data_id text primary key,
+            tile_data blob
+        );
+    """)
+    cur.execute("""
+        CREATE VIEW tiles AS
+        SELECT
+            tiles_shallow.TILES_COL_Z as zoom_level,
+            tiles_shallow.TILES_COL_X as tile_column,
+            tiles_shallow.TILES_COL_Y as tile_row,
+            tiles_data.tile_data as tile_data
+        FROM tiles_shallow
+        JOIN tiles_data ON tiles_shallow.TILES_COL_DATA_ID = tiles_data.tile_data_id;
+    """)
+    cur.execute("""
+        CREATE UNIQUE INDEX tiles_shallow_index on tiles_shallow (TILES_COL_Z, TILES_COL_X, TILES_COL_Y);
+    """)
+
     cur.execute("""create table metadata
         (name text, value text);""")
     cur.execute("""CREATE TABLE grids (zoom_level integer, tile_column integer,
@@ -31,8 +62,6 @@ def mbtiles_setup(cur):
     cur.execute("""CREATE TABLE grid_data (zoom_level integer, tile_column
     integer, tile_row integer, key_name text, key_json text);""")
     cur.execute("""create unique index name on metadata (name);""")
-    cur.execute("""create unique index tile_index on tiles
-        (zoom_level, tile_column, tile_row);""")
 
 def mbtiles_connect(mbtiles_file, silent):
     try:
@@ -50,15 +79,15 @@ def optimize_connection(cur):
     cur.execute("""PRAGMA journal_mode=DELETE""")
 
 def compression_prepare(cur, silent):
-    if not silent: 
+    if not silent:
         logger.debug('Prepare database compression.')
     cur.execute("""
-      CREATE TABLE if not exists images (
+    CREATE TABLE if not exists images (
         tile_data blob,
         tile_id integer);
     """)
     cur.execute("""
-      CREATE TABLE if not exists map (
+    CREATE TABLE if not exists map (
         zoom_level integer,
         tile_column integer,
         tile_row integer,
@@ -66,17 +95,17 @@ def compression_prepare(cur, silent):
     """)
 
 def optimize_database(cur, silent):
-    if not silent: 
+    if not silent:
         logger.debug('analyzing db')
     cur.execute("""ANALYZE;""")
-    if not silent: 
+    if not silent:
         logger.debug('cleaning db')
 
     # Workaround for python>=3.6.0,python<3.6.2
     # https://bugs.python.org/issue28518
     cur.isolation_level = None
     cur.execute("""VACUUM;""")
-    cur.isolation_level = ''  # reset default value of isolation_level
+    cur.isolation_level = '' # reset default value of isolation_level
 
 
 def compression_do(cur, con, chunk, silent):
@@ -85,7 +114,7 @@ def compression_do(cur, con, chunk, silent):
     overlapping = 0
     unique = 0
     total = 0
-    cur.execute("select count(zoom_level) from tiles")
+    cur.execute("""select count(zoom_level) from tiles""")
     res = cur.fetchone()
     total_tiles = res[0]
     last_id = 0
@@ -147,17 +176,17 @@ def compression_finalize(cur, con, silent):
         images.tile_data as tile_data FROM
         map JOIN images on images.tile_id = map.tile_id;""")
     cur.execute("""
-          CREATE UNIQUE INDEX map_index on map
+        CREATE UNIQUE INDEX map_index on map
             (zoom_level, tile_column, tile_row);""")
     cur.execute("""
-          CREATE UNIQUE INDEX images_id on images
+        CREATE UNIQUE INDEX images_id on images
             (tile_id);""")
 
     # Workaround for python>=3.6.0,python<3.6.2
     # https://bugs.python.org/issue28518
     con.isolation_level = None
     cur.execute("""vacuum;""")
-    con.isolation_level = ''  # reset default value of isolation_level
+    con.isolation_level = '' # reset default value of isolation_level
 
     cur.execute("""analyze;""")
 
@@ -184,28 +213,29 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
         metadata = json.load(open(os.path.join(directory_path, 'metadata.json'), 'r'))
         image_format = kwargs.get('format')
         for name, value in metadata.items():
-            cur.execute('insert into metadata (name, value) values (?, ?)',
+            cur.execute("""insert into metadata (name, value) values (?, ?)""",
                 (name, value))
-        if not silent: 
+        if not silent:
             logger.info('metadata from metadata.json restored')
     except IOError:
-        if not silent: 
+        if not silent:
             logger.warning('metadata.json not found')
 
     count = 0
     start_time = time.time()
+    tilesCount = 0
 
     for zoom_dir in get_dirs(directory_path):
         if kwargs.get("scheme") == 'ags':
             if not "L" in zoom_dir:
-                if not silent: 
+                if not silent:
                     logger.warning("You appear to be using an ags scheme on an non-arcgis Server cache.")
             z = int(zoom_dir.replace("L", ""))
         elif kwargs.get("scheme") == 'gwc':
             z=int(zoom_dir[-2:])
         else:
             if "L" in zoom_dir:
-                if not silent: 
+                if not silent:
                     logger.warning("You appear to be using a %s scheme on an arcgis Server cache. Try using --scheme=ags instead" % kwargs.get("scheme"))
             z = int(zoom_dir)
         for row_dir in get_dirs(os.path.join(directory_path, zoom_dir)):
@@ -241,10 +271,23 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
                     if (ext == image_format):
                         if not silent:
                             logger.debug(' Read tile from Zoom (z): %i\tCol (x): %i\tRow (y): %i' % (z, x, y))
-                        cur.execute("""insert into tiles (zoom_level,
-                            tile_column, tile_row, tile_data) values
-                            (?, ?, ?, ?);""",
-                            (z, x, y, sqlite3.Binary(file_content)))
+                        #create tile_id based on tile contents
+                        tileDataId = str(fnv1a(file_content))
+
+                        # insert tile object
+                        cur.execute(
+                            """INSERT OR IGNORE INTO tiles_data 
+                            (tile_data_id, tile_data) 
+                            VALUES (?, ?);""",
+                            (tileDataId, sqlite3.Binary(file_content)),
+                        )
+
+                        cur.execute(
+                            """INSERT INTO tiles_shallow 
+                            (TILES_COL_Z, TILES_COL_X, TILES_COL_Y, TILES_COL_DATA_ID) 
+                            VALUES (?, ?, ?, ?);""",
+                            (z, x, y, tileDataId),
+                        )
                         count = count + 1
                         if (count % 100) == 0 and not silent:
                             logger.info(" %s tiles inserted (%d tiles/sec)" % (count, count / (time.time() - start_time)))
