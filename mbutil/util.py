@@ -238,6 +238,7 @@ def _process_tile(
 
     con = mbtiles_connect(mbtiles_file, silent)
     cur = con.cursor()
+    cur.execute("PRAGMA busy_timeout = 5000;")
 
     # create tile_id based on tile contents
     tileDataId = str(fnv1a(file_content))
@@ -407,7 +408,7 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
                                 (z, x, y, key_name, json.dumps(key_json)),
                             )
         # Use a process pool to insert tiles in parallel
-        pool = Pool(processes=cpu_count())
+        pool = Pool(processes=cpu_count() // 2)
 
         pool.starmap(_process_tile, tiles_to_process)
         pool.close()
