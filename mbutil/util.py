@@ -314,19 +314,13 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
     start_time = time.time()
     tilesCount = 0
 
-    zoom_levels = get_dirs(directory_path)
-    
-    writer_processes = {} # a dict to store the writer processes
-    tile_queues = {} # a dict to store the queues
+    tile_queue = Queue()
+    db_writer_process = Process(
+        target=_db_writer, args=(mbtiles_file, tile_queue, silent)
+    )
+    db_writer_process.start()
 
-    for zoom_dir in zoom_levels:
-        tile_queue = Queue()
-        tile_queues[zoom_dir] = tile_queue
-        writer_process = Process(target=_db_writer, args=(mbtiles_file, tile_queue, silent))
-        writer_processes[zoom_dir] = writer_process
-        writer_process.start()
-
-    for zoom_dir in zoom_levels:
+    for zoom_dir in get_dirs(directory_path):
         if kwargs.get("scheme") == "ags":
             if not "L" in zoom_dir:
                 if not silent:
@@ -388,7 +382,7 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
                                 % (z, x, y)
                             )
 
-                        tile_queues[zoom_dir].put((z, x, y, file_content))
+                        tile_queue.put((z, x, y, file_content))
                         count = count + 1
                         if (count % 100) == 0 and not silent:
                             logger.info(
@@ -424,20 +418,17 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
                                 """insert into grid_data (zoom_level, tile_column, tile_row, key_name, key_json) values (?, ?, ?, ?, ?);""",
                                 (z, x, y, key_name, json.dumps(key_json)),
                             )
-    
-    for zoom_dir in zoom_levels:
-        tile_queues[zoom_dir].put(None) #signal writers to stop
-    for zoom_dir in zoom_levels:
-       writer_processes[zoom_dir].join() #wait for all writers to stop
-           
+
+    tile_queue.put(None)
+    db_writer_process.join()
+
     if not silent:
         logger.debug("tiles (and grids) inserted.")
-
     if kwargs.get("compression", False):
         compression_prepare(cur, silent)
         compression_do(cur, con, 256, silent)
         compression_finalize(cur, con, silent)
-    
+
     # Revert to DELETE mode after tile imports are complete.
     con.isolation_level = None
     cur.execute("""PRAGMA journal_mode=DELETE""")
