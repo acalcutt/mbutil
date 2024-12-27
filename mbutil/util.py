@@ -365,9 +365,7 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
     for zoom_dir in zoom_levels:
         tile_queue = Queue()
         tile_queues[zoom_dir] = tile_queue
-        writer_process = Process(
-            target=_db_writer, args=(mbtiles_file, tile_queue, silent, kwargs)
-        )
+        writer_process = Process(target=_db_writer, args=(mbtiles_file, tile_queue, silent), kwargs=kwargs)
         writer_processes[zoom_dir] = writer_process
         writer_process.start()
 
