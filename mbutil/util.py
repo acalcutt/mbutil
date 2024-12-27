@@ -10,6 +10,7 @@
 # https://github.com/mapbox/node-mbtiles/blob/master/lib/schema.sql
 
 import sqlite3, sys, logging, time, os, json, zlib, re, hashlib
+from multiprocessing import Process, Queue, cpu_count
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,18 @@ def fnv1a(data):
         h *= 1099511628211
         h &= 0xFFFFFFFFFFFFFFFF  # 64-bit mask
     return h
+
+
+def worker(data_queue, result_queue):
+    """Worker process that calculates FNV-1a hash."""
+    while True:
+        item = data_queue.get()
+        if item is None:  # Sentinel value for termination
+            break
+        file_id, file_content = item
+        tile_data_id = str(fnv1a(file_content))
+        result_queue.put((file_id, tile_data_id))
+
 
 def mbtiles_setup(cur):
     cur.execute("""
@@ -57,9 +70,9 @@ def mbtiles_setup(cur):
     cur.execute("""create table metadata
         (name text, value text);""")
     cur.execute("""CREATE TABLE grids (zoom_level integer, tile_column integer,
-    tile_row integer, grid blob);""")
+        tile_row integer, grid blob);""")
     cur.execute("""CREATE TABLE grid_data (zoom_level integer, tile_column
-    integer, tile_row integer, key_name text, key_json text);""")
+        integer, tile_row integer, key_name text, key_json text);""")
     cur.execute("""create unique index name on metadata (name);""")
 
 def mbtiles_connect(mbtiles_file, silent):
@@ -81,16 +94,16 @@ def compression_prepare(cur, silent):
     if not silent:
         logger.debug('Prepare database compression.')
     cur.execute("""
-    CREATE TABLE if not exists images (
-        tile_data blob,
-        tile_id integer);
+        CREATE TABLE if not exists images (
+            tile_data blob,
+            tile_id integer);
     """)
     cur.execute("""
-    CREATE TABLE if not exists map (
-        zoom_level integer,
-        tile_column integer,
-        tile_row integer,
-        tile_id integer);
+        CREATE TABLE if not exists map (
+            zoom_level integer,
+            tile_column integer,
+            tile_row integer,
+            tile_id integer);
     """)
 
 def optimize_database(cur, silent):
@@ -207,6 +220,16 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
     mbtiles_setup(cur)
     #~ image_format = 'png'
     image_format = kwargs.get('format', 'png')
+    
+    # Set up multiprocessing queues and processes
+    data_queue = Queue()
+    result_queue = Queue()
+    num_workers = cpu_count()
+    processes = []
+    for _ in range(num_workers):
+        p = Process(target=worker, args=(data_queue, result_queue))
+        processes.append(p)
+        p.start()
 
     try:
         metadata = json.load(open(os.path.join(directory_path, 'metadata.json'), 'r'))
@@ -223,6 +246,7 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
     count = 0
     start_time = time.time()
     tilesCount = 0
+    file_id_counter = 0  # Counter for unique file IDs
 
     for zoom_dir in get_dirs(directory_path):
         if kwargs.get("scheme") == 'ags':
@@ -270,26 +294,13 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
                     if (ext == image_format):
                         if not silent:
                             logger.debug(' Read tile from Zoom (z): %i\tCol (x): %i\tRow (y): %i' % (z, x, y))
-                        #create tile_id based on tile contents
-                        tileDataId = str(fnv1a(file_content))
-
-                        # insert tile object
-                        cur.execute(
-                            """INSERT OR IGNORE INTO tiles_data 
-                            (tile_data_id, tile_data) 
-                            VALUES (?, ?);""",
-                            (tileDataId, sqlite3.Binary(file_content)),
-                        )
-
-                        cur.execute(
-                            """INSERT INTO tiles_shallow 
-                            (TILES_COL_Z, TILES_COL_X, TILES_COL_Y, TILES_COL_DATA_ID) 
-                            VALUES (?, ?, ?, ?);""",
-                            (z, x, y, tileDataId),
-                        )
+                        # Send the file content and file ID to the worker queue
+                        data_queue.put((file_id_counter, file_content))
+                        
+                        # Increment the file ID counter
+                        file_id_counter += 1
                         count = count + 1
-                        if (count % 100) == 0 and not silent:
-                            logger.info(" %s tiles inserted (%d tiles/sec)" % (count, count / (time.time() - start_time)))
+
                     elif (ext == 'grid.json'):
                         if not silent:
                             logger.debug(' Read grid from Zoom (z): %i\tCol (x): %i\tRow (y): %i' % (z, x, y))
@@ -307,6 +318,37 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
                         for key_name in grid_keys:
                             key_json = data[key_name]
                             cur.execute("""insert into grid_data (zoom_level, tile_column, tile_row, key_name, key_json) values (?, ?, ?, ?, ?);""", (z, x, y, key_name, json.dumps(key_json)))
+        
+    # Send termination signals to workers
+    for _ in range(num_workers):
+        data_queue.put(None)
+
+    # Collect results and write to database sequentially
+    for _ in range(file_id_counter):
+            file_id, tile_data_id = result_queue.get()  # Dequeue result
+            cur.execute(
+                """INSERT OR IGNORE INTO tiles_data  
+                (tile_data_id, tile_data)  
+                VALUES (?, ?);""",
+                (tile_data_id, sqlite3.Binary(file_content)),
+            )
+
+            cur.execute(
+                """INSERT INTO tiles_shallow  
+                (TILES_COL_Z, TILES_COL_X, TILES_COL_Y, TILES_COL_DATA_ID)  
+                VALUES (?, ?, ?, ?);""",
+                (z, x, y, tile_data_id),
+            )
+    
+            if (count % 100) == 0 and not silent:
+                logger.info(" %s tiles inserted (%d tiles/sec)" % (count, count / (time.time() - start_time)))
+
+
+    finally:
+    # Ensure cleanup
+        for p in processes:
+            p.join()
+
 
     if not silent:
         logger.debug('tiles (and grids) inserted.')
@@ -316,7 +358,9 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
         compression_do(cur, con, 256, silent)
         compression_finalize(cur, con, silent)
 
-    optimize_database(con, silent)
+    optimize_database(cur, silent)
+    con.commit()
+    con.close()
 
 def mbtiles_metadata_to_disk(mbtiles_file, **kwargs):
     silent = kwargs.get('silent')
