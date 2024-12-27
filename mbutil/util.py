@@ -21,11 +21,16 @@ def flip_y(zoom, y):
 
 
 def fnv1a(data):
+    """
+    A simple FNV-1a hash to generate tile ids
+    """
     h = 14695981039346656037
+
     for b in data:
         h ^= b
         h *= 1099511628211
         h &= 0xFFFFFFFFFFFFFFFF  # 64-bit mask
+
     return h
 
 
@@ -235,36 +240,48 @@ def get_dirs(path):
 def _process_tile(
     mbtiles_file, directory_path, z, x, y, file_content, image_format, scheme, silent
 ):
+    con = None  # Initialize con to None
+    try:
+        con = mbtiles_connect(mbtiles_file, silent)
+        cur = con.cursor()
+        cur.execute("PRAGMA busy_timeout = 5000;")
 
-    con = mbtiles_connect(mbtiles_file, silent)
-    cur = con.cursor()
-    cur.execute("PRAGMA busy_timeout = 5000;")
+        # create tile_id based on tile contents
+        tileDataId = str(fnv1a(file_content))
 
-    # create tile_id based on tile contents
-    tileDataId = str(fnv1a(file_content))
-
-    # insert tile object
-    cur.execute(
-        """INSERT OR IGNORE INTO tiles_data 
-        (tile_data_id, tile_data) 
-        VALUES (?, ?);""",
-        (tileDataId, sqlite3.Binary(file_content)),
-    )
-
-    cur.execute(
-        """INSERT INTO tiles_shallow 
-        (TILES_COL_Z, TILES_COL_X, TILES_COL_Y, TILES_COL_DATA_ID) 
-        VALUES (?, ?, ?, ?);""",
-        (z, x, y, tileDataId),
-    )
-
-    if not silent:
-        logger.debug(
-            " Write tile from Zoom (z): %i\tCol (x): %i\tRow (y): %i" % (z, x, y)
+        # insert tile object
+        cur.execute(
+            """INSERT OR IGNORE INTO tiles_data 
+            (tile_data_id, tile_data) 
+            VALUES (?, ?);""",
+            (tileDataId, sqlite3.Binary(file_content)),
         )
 
-    con.commit()
-    con.close()
+        cur.execute(
+            """INSERT INTO tiles_shallow 
+            (TILES_COL_Z, TILES_COL_X, TILES_COL_Y, TILES_COL_DATA_ID) 
+            VALUES (?, ?, ?, ?);""",
+            (z, x, y, tileDataId),
+        )
+
+        if not silent:
+            logger.debug(
+                " Write tile from Zoom (z): %i\tCol (x): %i\tRow (y): %i" % (z, x, y)
+            )
+
+        con.commit()
+
+    except sqlite3.OperationalError as e:
+        if not silent:
+            logger.error(f"sqlite3.OperationalError in _process_tile: {e}")
+            logger.error(f"Failed to write tile (z,x,y) ({z},{x},{y})")
+    except Exception as e:
+        if not silent:
+            logger.error(f"Exception in _process_tile: {e}")
+            logger.error(f"Failed to write tile (z,x,y) ({z},{x},{y})")
+    finally:
+        if con:
+            con.close()
 
 
 def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
