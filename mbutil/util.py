@@ -10,7 +10,7 @@
 # https://github.com/mapbox/node-mbtiles/blob/master/lib/schema.sql
 
 import sqlite3, sys, logging, time, os, json, zlib, re, hashlib
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Process, Queue, Pool, cpu_count
 from functools import partial
 
 logger = logging.getLogger(__name__)
@@ -99,7 +99,7 @@ def mbtiles_connect(mbtiles_file, silent):
 
 
 def optimize_connection(cur):
-    #cur.execute("""PRAGMA synchronous=0""")
+    # cur.execute("""PRAGMA synchronous=0""")
     cur.execute("""PRAGMA journal_mode=WAL""")
 
 
@@ -223,7 +223,6 @@ def compression_finalize(cur, con, silent):
     )
 
     # Workaround for python>=3.6.0,python<3.6.2
-    # https://bugs.python.org/issue28518
     con.isolation_level = None
     cur.execute("""vacuum;""")
     con.isolation_level = ""  # reset default value of isolation_level
@@ -231,57 +230,59 @@ def compression_finalize(cur, con, silent):
     cur.execute("""analyze;""")
 
 
+def _db_writer(mbtiles_file, tile_queue, silent):
+    con = mbtiles_connect(mbtiles_file, silent)
+    cur = con.cursor()
+    cur.execute("PRAGMA busy_timeout = 5000;")
+
+    while True:
+        item = tile_queue.get()
+        if item is None:  # Signal to stop
+            break
+
+        z, x, y, file_content = item
+        try:
+            # create tile_id based on tile contents
+            tileDataId = str(fnv1a(file_content))
+
+            # insert tile object
+            cur.execute(
+                """INSERT OR IGNORE INTO tiles_data
+                (tile_data_id, tile_data)
+                VALUES (?, ?);""",
+                (tileDataId, sqlite3.Binary(file_content)),
+            )
+
+            cur.execute(
+                """INSERT INTO tiles_shallow
+                (TILES_COL_Z, TILES_COL_X, TILES_COL_Y, TILES_COL_DATA_ID)
+                VALUES (?, ?, ?, ?);""",
+                (z, x, y, tileDataId),
+            )
+
+            if not silent:
+                logger.debug(
+                    " Write tile from Zoom (z): %i\tCol (x): %i\tRow (y): %i"
+                    % (z, x, y)
+                )
+
+            con.commit()
+        except sqlite3.OperationalError as e:
+            if not silent:
+                logger.error(f"sqlite3.OperationalError in _db_writer: {e}")
+                logger.error(f"Failed to write tile (z,x,y) ({z},{x},{y})")
+        except Exception as e:
+            if not silent:
+                logger.error(f"Exception in _db_writer: {e}")
+                logger.error(f"Failed to write tile (z,x,y) ({z},{x},{y})")
+
+    con.close()
+
+
 def get_dirs(path):
     return [
         name for name in os.listdir(path) if os.path.isdir(os.path.join(path, name))
     ]
-
-
-def _process_tile(
-    mbtiles_file, directory_path, z, x, y, file_content, image_format, scheme, silent
-):
-    con = None  # Initialize con to None
-    try:
-        con = mbtiles_connect(mbtiles_file, silent)
-        cur = con.cursor()
-        cur.execute("PRAGMA busy_timeout = 5000;")
-
-        # create tile_id based on tile contents
-        tileDataId = str(fnv1a(file_content))
-
-        # insert tile object
-        cur.execute(
-            """INSERT OR IGNORE INTO tiles_data 
-            (tile_data_id, tile_data) 
-            VALUES (?, ?);""",
-            (tileDataId, sqlite3.Binary(file_content)),
-        )
-
-        cur.execute(
-            """INSERT INTO tiles_shallow 
-            (TILES_COL_Z, TILES_COL_X, TILES_COL_Y, TILES_COL_DATA_ID) 
-            VALUES (?, ?, ?, ?);""",
-            (z, x, y, tileDataId),
-        )
-
-        if not silent:
-            logger.debug(
-                " Write tile from Zoom (z): %i\tCol (x): %i\tRow (y): %i" % (z, x, y)
-            )
-
-        con.commit()
-
-    except sqlite3.OperationalError as e:
-        if not silent:
-            logger.error(f"sqlite3.OperationalError in _process_tile: {e}")
-            logger.error(f"Failed to write tile (z,x,y) ({z},{x},{y})")
-    except Exception as e:
-        if not silent:
-            logger.error(f"Exception in _process_tile: {e}")
-            logger.error(f"Failed to write tile (z,x,y) ({z},{x},{y})")
-    finally:
-        if con:
-            con.close()
 
 
 def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
@@ -313,8 +314,13 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
     start_time = time.time()
     tilesCount = 0
 
+    tile_queue = Queue()
+    db_writer_process = Process(
+        target=_db_writer, args=(mbtiles_file, tile_queue, silent)
+    )
+    db_writer_process.start()
+
     for zoom_dir in get_dirs(directory_path):
-        tiles_to_process = []
         if kwargs.get("scheme") == "ags":
             if not "L" in zoom_dir:
                 if not silent:
@@ -376,19 +382,7 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
                                 % (z, x, y)
                             )
 
-                        tiles_to_process.append(
-                            (
-                                mbtiles_file,
-                                directory_path,
-                                z,
-                                x,
-                                y,
-                                file_content,
-                                image_format,
-                                kwargs.get("scheme"),
-                                silent,
-                            )
-                        )
+                        tile_queue.put((z, x, y, file_content))
                         count = count + 1
                         if (count % 100) == 0 and not silent:
                             logger.info(
@@ -424,16 +418,12 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
                                 """insert into grid_data (zoom_level, tile_column, tile_row, key_name, key_json) values (?, ?, ?, ?, ?);""",
                                 (z, x, y, key_name, json.dumps(key_json)),
                             )
-        # Use a process pool to insert tiles in parallel
-        pool = Pool(processes=cpu_count() // 2)
 
-        pool.starmap(_process_tile, tiles_to_process)
-        pool.close()
-        pool.join()
+    tile_queue.put(None)
+    db_writer_process.join()
 
     if not silent:
         logger.debug("tiles (and grids) inserted.")
-
     if kwargs.get("compression", False):
         compression_prepare(cur, silent)
         compression_do(cur, con, 256, silent)
