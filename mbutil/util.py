@@ -95,8 +95,7 @@ def mbtiles_connect(mbtiles_file, silent):
 
 def optimize_connection(cur):
     cur.execute("""PRAGMA synchronous=0""")
-    cur.execute("""PRAGMA locking_mode=EXCLUSIVE""")
-    cur.execute("""PRAGMA journal_mode=DELETE""")
+    cur.execute("""PRAGMA journal_mode=WAL""")
 
 
 def compression_prepare(cur, silent):
@@ -422,6 +421,10 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
         compression_do(cur, con, 256, silent)
         compression_finalize(cur, con, silent)
 
+    # Revert to DELETE mode after tile imports are complete.
+    con.isolation_level = None
+    cur.execute("""PRAGMA journal_mode=DELETE""")
+    con.isolation_level = ""  # reset default value of isolation_level
     optimize_database(con, silent)
 
 
