@@ -231,6 +231,7 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
         processes.append(p)
         p.start()
 
+    metadata = None #Initialize for error handling
     try:
         metadata = json.load(open(os.path.join(directory_path, 'metadata.json'), 'r'))
         image_format = kwargs.get('format')
@@ -247,105 +248,108 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
     start_time = time.time()
     tilesCount = 0
     file_id_counter = 0  # Counter for unique file IDs
-
-    for zoom_dir in get_dirs(directory_path):
-        if kwargs.get("scheme") == 'ags':
-            if not "L" in zoom_dir:
-                if not silent:
-                    logger.warning("You appear to be using an ags scheme on an non-arcgis Server cache.")
-            z = int(zoom_dir.replace("L", ""))
-        elif kwargs.get("scheme") == 'gwc':
-            z=int(zoom_dir[-2:])
-        else:
-            if "L" in zoom_dir:
-                if not silent:
-                    logger.warning("You appear to be using a %s scheme on an arcgis Server cache. Try using --scheme=ags instead" % kwargs.get("scheme"))
-            z = int(zoom_dir)
-        for row_dir in get_dirs(os.path.join(directory_path, zoom_dir)):
+    try:
+        for zoom_dir in get_dirs(directory_path):
             if kwargs.get("scheme") == 'ags':
-                y = flip_y(z, int(row_dir.replace("R", ""), 16))
+                if not "L" in zoom_dir:
+                    if not silent:
+                        logger.warning("You appear to be using an ags scheme on an non-arcgis Server cache.")
+                z = int(zoom_dir.replace("L", ""))
             elif kwargs.get("scheme") == 'gwc':
-                pass
-            elif kwargs.get("scheme") == 'zyx':
-                y = flip_y(int(z), int(row_dir))
+                z=int(zoom_dir[-2:])
             else:
-                x = int(row_dir)
-            for current_file in os.listdir(os.path.join(directory_path, zoom_dir, row_dir)):
-                if current_file == ".DS_Store" and not silent:
-                    logger.warning("Your OS is MacOS,and the .DS_Store file will be ignored.")
+                if "L" in zoom_dir:
+                    if not silent:
+                        logger.warning("You appear to be using a %s scheme on an arcgis Server cache. Try using --scheme=ags instead" % kwargs.get("scheme"))
+                z = int(zoom_dir)
+            for row_dir in get_dirs(os.path.join(directory_path, zoom_dir)):
+                if kwargs.get("scheme") == 'ags':
+                    y = flip_y(z, int(row_dir.replace("R", ""), 16))
+                elif kwargs.get("scheme") == 'gwc':
+                    pass
+                elif kwargs.get("scheme") == 'zyx':
+                    y = flip_y(int(z), int(row_dir))
                 else:
-                    file_name, ext = current_file.split('.',1)
-                    f = open(os.path.join(directory_path, zoom_dir, row_dir, current_file), 'rb')
-                    file_content = f.read()
-                    f.close()
-                    if kwargs.get('scheme') == 'xyz':
-                        y = flip_y(int(z), int(file_name))
-                    elif kwargs.get("scheme") == 'ags':
-                        x = int(file_name.replace("C", ""), 16)
-                    elif kwargs.get("scheme") == 'gwc':
-                        x, y = file_name.split('_')
-                        x = int(x)
-                        y = int(y)
-                    elif kwargs.get("scheme") == 'zyx':
-                        x = int(file_name)
+                    x = int(row_dir)
+                for current_file in os.listdir(os.path.join(directory_path, zoom_dir, row_dir)):
+                    if current_file == ".DS_Store" and not silent:
+                        logger.warning("Your OS is MacOS,and the .DS_Store file will be ignored.")
                     else:
-                        y = int(file_name)
+                        file_name, ext = current_file.split('.',1)
+                        f = open(os.path.join(directory_path, zoom_dir, row_dir, current_file), 'rb')
+                        file_content = f.read()
+                        f.close()
+                        if kwargs.get('scheme') == 'xyz':
+                            y = flip_y(int(z), int(file_name))
+                        elif kwargs.get("scheme") == 'ags':
+                            x = int(file_name.replace("C", ""), 16)
+                        elif kwargs.get("scheme") == 'gwc':
+                            x, y = file_name.split('_')
+                            x = int(x)
+                            y = int(y)
+                        elif kwargs.get("scheme") == 'zyx':
+                            x = int(file_name)
+                        else:
+                            y = int(file_name)
 
-                    if (ext == image_format):
-                        if not silent:
-                            logger.debug(' Read tile from Zoom (z): %i\tCol (x): %i\tRow (y): %i' % (z, x, y))
-                        # Send the file content and file ID to the worker queue
-                        data_queue.put((file_id_counter, file_content))
-                        
-                        # Increment the file ID counter
-                        file_id_counter += 1
-                        count = count + 1
+                        if (ext == image_format):
+                            if not silent:
+                                logger.debug(' Read tile from Zoom (z): %i\tCol (x): %i\tRow (y): %i' % (z, x, y))
+                            # Send the file content and file ID to the worker queue
+                            data_queue.put((file_id_counter, file_content))
+                            
+                            # Increment the file ID counter
+                            file_id_counter += 1
+                            count = count + 1
 
-                    elif (ext == 'grid.json'):
-                        if not silent:
-                            logger.debug(' Read grid from Zoom (z): %i\tCol (x): %i\tRow (y): %i' % (z, x, y))
-                        # Remove potential callback with regex
-                        file_content = file_content.decode('utf-8')
-                        has_callback = re.match(r'[\w\s=+-/]+\(({(.|\n)*})\);?', file_content)
-                        if has_callback:
-                            file_content = has_callback.group(1)
-                        utfgrid = json.loads(file_content)
+                        elif (ext == 'grid.json'):
+                            if not silent:
+                                logger.debug(' Read grid from Zoom (z): %i\tCol (x): %i\tRow (y): %i' % (z, x, y))
+                            # Remove potential callback with regex
+                            file_content = file_content.decode('utf-8')
+                            has_callback = re.match(r'[\w\s=+-/]+\(({(.|\n)*})\);?', file_content)
+                            if has_callback:
+                                file_content = has_callback.group(1)
+                            utfgrid = json.loads(file_content)
 
-                        data = utfgrid.pop('data')
-                        compressed = zlib.compress(json.dumps(utfgrid).encode())
-                        cur.execute("""insert into grids (zoom_level, tile_column, tile_row, grid) values (?, ?, ?, ?) """, (z, x, y, sqlite3.Binary(compressed)))
-                        grid_keys = [k for k in utfgrid['keys'] if k != ""]
-                        for key_name in grid_keys:
-                            key_json = data[key_name]
-                            cur.execute("""insert into grid_data (zoom_level, tile_column, tile_row, key_name, key_json) values (?, ?, ?, ?, ?);""", (z, x, y, key_name, json.dumps(key_json)))
-        
-    # Send termination signals to workers
-    for _ in range(num_workers):
-        data_queue.put(None)
-
-    # Collect results and write to database sequentially
-    for _ in range(file_id_counter):
-            file_id, tile_data_id = result_queue.get()  # Dequeue result
-            cur.execute(
-                """INSERT OR IGNORE INTO tiles_data  
-                (tile_data_id, tile_data)  
-                VALUES (?, ?);""",
-                (tile_data_id, sqlite3.Binary(file_content)),
-            )
-
-            cur.execute(
-                """INSERT INTO tiles_shallow  
-                (TILES_COL_Z, TILES_COL_X, TILES_COL_Y, TILES_COL_DATA_ID)  
-                VALUES (?, ?, ?, ?);""",
-                (z, x, y, tile_data_id),
-            )
+                            data = utfgrid.pop('data')
+                            compressed = zlib.compress(json.dumps(utfgrid).encode())
+                            cur.execute("""insert into grids (zoom_level, tile_column, tile_row, grid) values (?, ?, ?, ?) """, (z, x, y, sqlite3.Binary(compressed)))
+                            grid_keys = [k for k in utfgrid['keys'] if k != ""]
+                            for key_name in grid_keys:
+                                key_json = data[key_name]
+                                cur.execute("""insert into grid_data (zoom_level, tile_column, tile_row, key_name, key_json) values (?, ?, ?, ?, ?);""", (z, x, y, key_name, json.dumps(key_json)))
     
-            if (count % 100) == 0 and not silent:
-                logger.info(" %s tiles inserted (%d tiles/sec)" % (count, count / (time.time() - start_time)))
+        # Send termination signals to workers
+        for _ in range(num_workers):
+            data_queue.put(None)
 
+        # Collect results and write to database sequentially
+        for _ in range(file_id_counter):
+                file_id, tile_data_id = result_queue.get()  # Dequeue result
+                cur.execute(
+                    """INSERT OR IGNORE INTO tiles_data  
+                    (tile_data_id, tile_data)  
+                    VALUES (?, ?);""",
+                    (tile_data_id, sqlite3.Binary(file_content)),
+                )
+
+                cur.execute(
+                    """INSERT INTO tiles_shallow  
+                    (TILES_COL_Z, TILES_COL_X, TILES_COL_Y, TILES_COL_DATA_ID)  
+                    VALUES (?, ?, ?, ?);""",
+                    (z, x, y, tile_data_id),
+                )
+        
+                if (count % 100) == 0 and not silent:
+                    logger.info(" %s tiles inserted (%d tiles/sec)" % (count, count / (time.time() - start_time)))
+    except Exception as e:
+        if not silent:
+            logger.error("An error occurred during processing")
+            logger.exception(e)
 
     finally:
-    # Ensure cleanup
+        # Ensure cleanup
         for p in processes:
             p.join()
 
