@@ -33,52 +33,52 @@ def fnv1a(data):
 def mbtiles_setup(cur):
     cur.execute(
         """
-    CREATE TABLE tiles_shallow (
-      TILES_COL_Z integer,
-      TILES_COL_X integer,
-      TILES_COL_Y integer,
-      TILES_COL_DATA_ID text,
-      primary key(TILES_COL_Z,TILES_COL_X,TILES_COL_Y)
-    ) without rowid;
-  """
+        CREATE TABLE tiles_shallow (
+            TILES_COL_Z integer,
+            TILES_COL_X integer,
+            TILES_COL_Y integer,
+            TILES_COL_DATA_ID text,
+            primary key(TILES_COL_Z,TILES_COL_X,TILES_COL_Y)
+        ) without rowid;
+        """
     )
     cur.execute(
         """
-    CREATE TABLE tiles_data (
-      tile_data_id text primary key,
-      tile_data blob
-    );
-  """
+        CREATE TABLE tiles_data (
+            tile_data_id text primary key,
+            tile_data blob
+        );
+        """
     )
     cur.execute(
         """
-    CREATE VIEW tiles AS
-    SELECT
-      tiles_shallow.TILES_COL_Z as zoom_level,
-      tiles_shallow.TILES_COL_X as tile_column,
-      tiles_shallow.TILES_COL_Y as tile_row,
-      tiles_data.tile_data as tile_data
-    FROM tiles_shallow
-    JOIN tiles_data ON tiles_shallow.TILES_COL_DATA_ID = tiles_data.tile_data_id;
-  """
+        CREATE VIEW tiles AS
+        SELECT
+            tiles_shallow.TILES_COL_Z as zoom_level,
+            tiles_shallow.TILES_COL_X as tile_column,
+            tiles_shallow.TILES_COL_Y as tile_row,
+            tiles_data.tile_data as tile_data
+        FROM tiles_shallow
+        JOIN tiles_data ON tiles_shallow.TILES_COL_DATA_ID = tiles_data.tile_data_id;
+        """
     )
     cur.execute(
         """
-    CREATE UNIQUE INDEX tiles_shallow_index on tiles_shallow (TILES_COL_Z, TILES_COL_X, TILES_COL_Y);
-  """
+        CREATE UNIQUE INDEX tiles_shallow_index on tiles_shallow (TILES_COL_Z, TILES_COL_X, TILES_COL_Y);
+        """
     )
 
     cur.execute(
         """create table metadata
-    (name text, value text);"""
+        (name text, value text);"""
     )
     cur.execute(
         """CREATE TABLE grids (zoom_level integer, tile_column integer,
-  tile_row integer, grid blob);"""
+        tile_row integer, grid blob);"""
     )
     cur.execute(
         """CREATE TABLE grid_data (zoom_level integer, tile_column
-  integer, tile_row integer, key_name text, key_json text);"""
+        integer, tile_row integer, key_name text, key_json text);"""
     )
     cur.execute("""create unique index name on metadata (name);""")
 
@@ -105,19 +105,19 @@ def compression_prepare(cur, silent):
         logger.debug("Prepare database compression.")
     cur.execute(
         """
-  CREATE TABLE if not exists images (
-    tile_data blob,
-    tile_id integer);
-  """
+        CREATE TABLE if not exists images (
+            tile_data blob,
+            tile_id integer);
+        """
     )
     cur.execute(
         """
-  CREATE TABLE if not exists map (
-    zoom_level integer,
-    tile_column integer,
-    tile_row integer,
-    tile_id integer);
-  """
+        CREATE TABLE if not exists map (
+            zoom_level integer,
+            tile_column integer,
+            tile_row integer,
+            tile_id integer);
+        """
     )
 
 
@@ -155,7 +155,7 @@ def compression_do(cur, con, chunk, silent):
         start = time.time()
         cur.execute(
             """select zoom_level, tile_column, tile_row, tile_data
-      from tiles where rowid > ? and rowid <= ?""",
+            from tiles where rowid > ? and rowid <= ?""",
             ((i * chunk), ((i + 1) * chunk)),
         )
         if not silent:
@@ -167,8 +167,8 @@ def compression_do(cur, con, chunk, silent):
                 overlapping = overlapping + 1
                 start = time.time()
                 query = """insert into map
-          (zoom_level, tile_column, tile_row, tile_id)
-          values (?, ?, ?, ?)"""
+                (zoom_level, tile_column, tile_row, tile_id)
+                values (?, ?, ?, ?)"""
                 if not silent:
                     logger.debug("insert: %s" % (time.time() - start))
                 cur.execute(query, (r[0], r[1], r[2], ids[files.index(r[3])]))
@@ -181,15 +181,15 @@ def compression_do(cur, con, chunk, silent):
 
                 start = time.time()
                 query = """insert into images
-          (tile_id, tile_data)
-          values (?, ?)"""
+                (tile_id, tile_data)
+                values (?, ?)"""
                 cur.execute(query, (str(last_id), sqlite3.Binary(r[3])))
                 if not silent:
                     logger.debug("insert into images: %s" % (time.time() - start))
                 start = time.time()
                 query = """insert into map
-          (zoom_level, tile_column, tile_row, tile_id)
-          values (?, ?, ?, ?)"""
+                (zoom_level, tile_column, tile_row, tile_id)
+                values (?, ?, ?, ?)"""
                 cur.execute(query, (r[0], r[1], r[2], last_id))
                 if not silent:
                     logger.debug("insert into map: %s" % (time.time() - start))
@@ -202,21 +202,21 @@ def compression_finalize(cur, con, silent):
     cur.execute("""drop table tiles;""")
     cur.execute(
         """create view tiles as
-    select map.zoom_level as zoom_level,
-    map.tile_column as tile_column,
-    map.tile_row as tile_row,
-    images.tile_data as tile_data FROM
-    map JOIN images on images.tile_id = map.tile_id;"""
+        select map.zoom_level as zoom_level,
+        map.tile_column as tile_column,
+        map.tile_row as tile_row,
+        images.tile_data as tile_data FROM
+        map JOIN images on images.tile_id = map.tile_id;"""
     )
     cur.execute(
         """
-    CREATE UNIQUE INDEX map_index on map
-      (zoom_level, tile_column, tile_row);"""
+        CREATE UNIQUE INDEX map_index on map
+        (zoom_level, tile_column, tile_row);"""
     )
     cur.execute(
         """
-    CREATE UNIQUE INDEX images_id on images
-      (tile_id);"""
+        CREATE UNIQUE INDEX images_id on images
+        (tile_id);"""
     )
 
     # Workaround for python>=3.6.0,python<3.6.2
@@ -247,17 +247,23 @@ def _process_tile(
     # insert tile object
     cur.execute(
         """INSERT OR IGNORE INTO tiles_data 
-    (tile_data_id, tile_data) 
-    VALUES (?, ?);""",
+        (tile_data_id, tile_data) 
+        VALUES (?, ?);""",
         (tileDataId, sqlite3.Binary(file_content)),
     )
 
     cur.execute(
         """INSERT INTO tiles_shallow 
-    (TILES_COL_Z, TILES_COL_X, TILES_COL_Y, TILES_COL_DATA_ID) 
-    VALUES (?, ?, ?, ?);""",
+        (TILES_COL_Z, TILES_COL_X, TILES_COL_Y, TILES_COL_DATA_ID) 
+        VALUES (?, ?, ?, ?);""",
         (z, x, y, tileDataId),
     )
+
+    if not silent:
+        logger.debug(
+            " Write tile from Zoom (z): %i\tCol (x): %i\tRow (y): %i" % (z, x, y)
+        )
+
     con.commit()
     con.close()
 
@@ -291,9 +297,8 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
     start_time = time.time()
     tilesCount = 0
 
-    tiles_to_process = []
-
     for zoom_dir in get_dirs(directory_path):
+        tiles_to_process = []
         if kwargs.get("scheme") == "ags":
             if not "L" in zoom_dir:
                 if not silent:
@@ -403,13 +408,12 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
                                 """insert into grid_data (zoom_level, tile_column, tile_row, key_name, key_json) values (?, ?, ?, ?, ?);""",
                                 (z, x, y, key_name, json.dumps(key_json)),
                             )
+        # Use a process pool to insert tiles in parallel
+        pool = Pool(processes=cpu_count())
 
-    # Use a process pool to insert tiles in parallel
-    pool = Pool(processes=cpu_count())
-
-    pool.starmap(_process_tile, tiles_to_process)
-    pool.close()
-    pool.join()
+        pool.starmap(_process_tile, tiles_to_process)
+        pool.close()
+        pool.join()
 
     if not silent:
         logger.debug("tiles (and grids) inserted.")
@@ -514,10 +518,10 @@ def mbtiles_to_disk(mbtiles_file, directory_path, **kwargs):
         y = g[2]  # y
         grid_data_cursor = con.execute(
             """select key_name, key_json FROM
-      grid_data WHERE
-      zoom_level = %(zoom_level)d and
-      tile_column = %(tile_column)d and
-      tile_row = %(y)d;"""
+        grid_data WHERE
+        zoom_level = %(zoom_level)d and
+        tile_column = %(tile_column)d and
+        tile_row = %(y)d;"""
             % locals()
         )
         if kwargs.get("scheme") == "xyz":
