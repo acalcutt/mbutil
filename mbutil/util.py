@@ -21,11 +21,16 @@ def flip_y(zoom, y):
 
 
 def fnv1a(data):
+    """
+    A simple FNV-1a hash to generate tile ids
+    """
     h = 14695981039346656037
+
     for b in data:
         h ^= b
         h *= 1099511628211
         h &= 0xFFFFFFFFFFFFFFFF  # 64-bit mask
+
     return h
 
 
@@ -225,18 +230,12 @@ def compression_finalize(cur, con, silent):
     cur.execute("""analyze;""")
 
 
-def _db_writer(mbtiles_file, tile_queue, silent, **kwargs):
-    con = mbtiles_connect(mbtiles_file, silent)
-    cur = con.cursor()
-    cur.execute("PRAGMA busy_timeout = 5000;")
-
+def _tile_processor(tile_queue, process_queue, kwargs, silent):
     while True:
         item = tile_queue.get()
         if item is None:  # Signal to stop
             break
-
         directory_path, zoom_dir, row_dir, current_file = item
-
         try:
             f = open(
                 os.path.join(directory_path, zoom_dir, row_dir, current_file), "rb"
@@ -267,15 +266,35 @@ def _db_writer(mbtiles_file, tile_queue, silent, **kwargs):
                 x = int(row_dir)
                 y = int(file_name)
 
-            # create tile_id based on tile contents
             tileDataId = str(fnv1a(file_content))
+            process_queue.put((z, x, y, tileDataId, sqlite3.Binary(file_content)))
+        except Exception as e:
+            if not silent:
+                logger.error(f"Exception in _tile_processor: {e}")
+                logger.error(
+                    f"Failed to read/process tile from file: {current_file} in dir {zoom_dir}/{row_dir}"
+                )
+
+
+def _db_writer(mbtiles_file, process_queue, silent):
+    con = mbtiles_connect(mbtiles_file, silent)
+    cur = con.cursor()
+    cur.execute("PRAGMA busy_timeout = 5000;")
+
+    while True:
+        item = process_queue.get()
+        if item is None:  # Signal to stop
+            break
+        z, x, y, tileDataId, file_content = item
+
+        try:
 
             # insert tile object
             cur.execute(
                 """INSERT OR IGNORE INTO tiles_data
                (tile_data_id, tile_data)
                VALUES (?, ?);""",
-                (tileDataId, sqlite3.Binary(file_content)),
+                (tileDataId, file_content),
             )
 
             cur.execute(
@@ -295,15 +314,11 @@ def _db_writer(mbtiles_file, tile_queue, silent, **kwargs):
         except sqlite3.OperationalError as e:
             if not silent:
                 logger.error(f"sqlite3.OperationalError in _db_writer: {e}")
-                logger.error(
-                    f"Failed to write tile from file: {current_file} in dir {zoom_dir}/{row_dir}"
-                )
+                logger.error(f"Failed to write tile (z,x,y) ({z},{x},{y}) - to db")
         except Exception as e:
             if not silent:
                 logger.error(f"Exception in _db_writer: {e}")
-                logger.error(
-                    f"Failed to write tile from file: {current_file} in dir {zoom_dir}/{row_dir}"
-                )
+                logger.error(f"Failed to write tile (z,x,y) ({z},{x},{y}) - to db")
 
     con.close()
 
@@ -359,17 +374,42 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
 
     zoom_levels.sort(key=get_zoom_level)
 
-    writer_processes = {}  # a dict to store the writer processes
-    tile_queues = {}  # a dict to store the queues
+    process_queue = Queue()
+    writer_process = Process(
+        target=_db_writer, args=(mbtiles_file, process_queue, silent)
+    )
+    writer_process.start()
+
+    tile_processes = {}
+    tile_queues = {}
 
     for zoom_dir in zoom_levels:
         tile_queue = Queue()
         tile_queues[zoom_dir] = tile_queue
-        writer_process = Process(target=_db_writer, args=(mbtiles_file, tile_queue, silent), kwargs=kwargs)
-        writer_processes[zoom_dir] = writer_process
-        writer_process.start()
+        tile_process = Process(
+            target=_tile_processor, args=(tile_queue, process_queue, kwargs, silent)
+        )
+        tile_processes[zoom_dir] = tile_process
+        tile_process.start()
 
     for zoom_dir in zoom_levels:
+        if kwargs.get("scheme") == "ags":
+            if not "L" in zoom_dir:
+                if not silent:
+                    logger.warning(
+                        "You appear to be using an ags scheme on an non-arcgis Server cache."
+                    )
+            z = int(zoom_dir.replace("L", ""))
+        elif kwargs.get("scheme") == "gwc":
+            z = int(zoom_dir[-2:])
+        else:
+            if "L" in zoom_dir:
+                if not silent:
+                    logger.warning(
+                        "You appear to be using a %s scheme on an arcgis Server cache. Try using --scheme=ags instead"
+                        % kwargs.get("scheme")
+                    )
+            z = int(zoom_dir)
         for row_dir in get_dirs(os.path.join(directory_path, zoom_dir)):
             for current_file in os.listdir(
                 os.path.join(directory_path, zoom_dir, row_dir)
@@ -385,24 +425,20 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
                             " Read tile from Zoom (z): %i from file %s in row %s"
                             % (z, current_file, row_dir)
                         )
-
-                    tile_queues[zoom_dir].put(
-                        (directory_path, zoom_dir, row_dir, current_file)
-                    )
-                    count = count + 1
-                    if (count % 100) == 0 and not silent:
-                        logger.info(
-                            " %s tiles inserted (%d tiles/sec)"
-                            % (count, count / (time.time() - start_time))
-                        )
-
-                    if ext == "grid.json":
+                    file_name, ext = current_file.split(".", 1)
+                    if "grid.json" in current_file:
                         if not silent:
                             logger.debug(
                                 " Read grid from Zoom (z): %i\tCol (x): %i\tRow (y): %i"
                                 % (z, x, y)
                             )
                         # Remove potential callback with regex
+                        file_path = os.path.join(
+                            directory_path, zoom_dir, row_dir, current_file
+                        )
+                        f = open(file_path, "rb")
+                        file_content = f.read()
+                        f.close()
                         file_content = file_content.decode("utf-8")
                         has_callback = re.match(
                             r"[\w\s=+-/]+\(({(.|\n)*})\);?", file_content
@@ -413,6 +449,22 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
 
                         data = utfgrid.pop("data")
                         compressed = zlib.compress(json.dumps(utfgrid).encode())
+                        if kwargs.get("scheme") == "xyz":
+                            y = flip_y(int(z), int(file_name))
+                            x = int(row_dir)
+                        elif kwargs.get("scheme") == "ags":
+                            y = flip_y(z, int(row_dir.replace("R", ""), 16))
+                            x = int(file_name.replace("C", ""), 16)
+                        elif kwargs.get("scheme") == "gwc":
+                            x, y = file_name.split("_")
+                            x = int(x)
+                            y = int(y)
+                        elif kwargs.get("scheme") == "zyx":
+                            x = int(file_name)
+                            y = int(row_dir)
+                        else:
+                            x = int(row_dir)
+                            y = int(file_name)
                         cur.execute(
                             """insert into grids (zoom_level, tile_column, tile_row, grid) values (?, ?, ?, ?) """,
                             (z, x, y, sqlite3.Binary(compressed)),
@@ -424,11 +476,25 @@ def disk_to_mbtiles(directory_path, mbtiles_file, **kwargs):
                                 """insert into grid_data (zoom_level, tile_column, tile_row, key_name, key_json) values (?, ?, ?, ?, ?);""",
                                 (z, x, y, key_name, json.dumps(key_json)),
                             )
+                    else:
+                        tile_queues[zoom_dir].put(
+                            (directory_path, zoom_dir, row_dir, current_file)
+                        )
+                        count = count + 1
+                        if (count % 100) == 0 and not silent:
+                            logger.info(
+                                " %s tiles inserted (%d tiles/sec)"
+                                % (count, count / (time.time() - start_time))
+                            )
 
     for zoom_dir in zoom_levels:
-        tile_queues[zoom_dir].put(None)  # signal writers to stop
+        tile_queues[zoom_dir].put(None)  # signal tile processors to stop
+
     for zoom_dir in zoom_levels:
-        writer_processes[zoom_dir].join()  # wait for all writers to stop
+        process_queues[zoom_dir].put(None)
+    for zoom_dir in zoom_levels:
+        tile_processes[zoom_dir].join()
+    writer_process.join()
 
     if not silent:
         logger.debug("tiles (and grids) inserted.")
