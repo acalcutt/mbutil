@@ -17,13 +17,12 @@ def flip_y(zoom, y):
     return (2**zoom-1) - y
 
 def fnv1a(data):
-    """
-    A simple FNV-1a hash to generate tile ids
-    """
-    hash = 0x811c9dc5
-    for b in bytearray(data):
-        hash = (hash ^ b) * 0x1000193
-    return hash & 0xFFFFFFFF
+    h = 14695981039346656037
+    for b in data:
+        h ^= b
+        h *= 1099511628211
+        h &= 0xFFFFFFFFFFFFFFFF  # 64-bit mask
+    return h
 
 def mbtiles_setup(cur):
     cur.execute("""
